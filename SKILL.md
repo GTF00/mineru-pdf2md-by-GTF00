@@ -25,6 +25,18 @@ The skill wraps the MinerU OpenAPI v4 (`https://mineru.net/api/v4`) with a
 Bearer token stored locally. The converter logic lives in
 `scripts/mineru_convert.py` — do **not** re-implement it; invoke the script.
 
+> **MinerU 4.0 — this skill uses the cloud API, not the local CLI.** The upstream
+> `opendatalab/mineru` repo now ships its own `skills/mineru`, but that one drives
+> the **local** MinerU 4.0 CLI/SDK (`mineru parse`, `mineru read`, `mineru-kit`, a
+> local doc library, and `flash/basic/standard/advanced` tiers that need
+> locally-installed models + GPU/RAM). This skill instead uses the **cloud
+> OpenAPI v4** (`mineru.net`), which needs no local GPU and — crucially — returns
+> MinerU's own `page_number` blocks, the source of the printed-page markers this
+> skill is built around. So we did **not** replace the architecture; we ported the
+> genuinely new *cloud-API* capabilities (see "MinerU 4.0" below) into it and kept
+> every special feature (auto split/merge, printed-page markers, batch, heading
+> restoration, page audit/repair, decorative-image filtering, char-spacing cleanup).
+
 ## Inputs the skill needs
 
 - **PDF path or directory** (required): a local file or folder the user provides.
@@ -79,6 +91,12 @@ Map the user's choices to arguments:
 
 # Single file, md-only:
 (VENV_PY) scripts/mineru_convert.py convert "(PDF)" "(OUT_DIR)" --md-only
+
+# Partial parse of pages 1-10 (MinerU 4.0 page_ranges; skips local auto-split):
+(VENV_PY) scripts/mineru_convert.py convert "(PDF)" "(OUT_DIR)" --pages "1-10"
+
+# Scanned/bitmap PDF -> enable OCR; non-Chinese-only book -> --lang en:
+(VENV_PY) scripts/mineru_convert.py convert "(PDF)" "(OUT_DIR)" --ocr --lang en
 ```
 
 ### Batch (whole directory)
@@ -88,6 +106,12 @@ Map the user's choices to arguments:
 
 # md-only, 4 workers, re-run even existing md (--force):
 (VENV_PY) scripts/mineru_convert.py batch "(IN_DIR)" "(OUT_DIR)" --md-only --workers 4 --force
+
+# Whole batch with OCR on + English OCR hint (4.0 flags apply to every file):
+(VENV_PY) scripts/mineru_convert.py batch "(IN_DIR)" "(OUT_DIR)" --ocr --lang en --workers 4
+
+# Whole batch, only the intro + first chapters of every PDF (4.0 page_ranges):
+(VENV_PY) scripts/mineru_convert.py batch "(IN_DIR)" "(OUT_DIR)" --pages "1-30"
 ```
 - The folder structure under `IN_DIR` is mirrored under `OUT_DIR` by default, so
   each source PDF `IN_DIR/A/x.pdf` becomes `OUT_DIR/A/x.md` (+ `x_files/`).
@@ -270,6 +294,49 @@ code, or as a routine sanity check on any converted tree.
 printed sequence can jump (…184, then 187, 188…) while the PDF pages are continuous;
 and every **chapter-opening page plus the colophon** is unnumbered. Verify a
 suspicious value by reading that page's own text layer before "fixing" it.
+
+## MinerU 4.0: new cloud-API capabilities (added in this version)
+
+The upstream MinerU 4.0 (Sept 2026) changed a lot; we folded in the parts that
+apply to the **cloud OpenAPI v4** this skill uses, and explicitly did **not**
+adopt the parts that belong to the local CLI only.
+
+### Adopted (cloud API v4 request-body fields — all opt-in, safe defaults)
+- **`--pages RANGES`** → cloud `page_ranges` (e.g. `"1-10"`, `"2,4-6"`). Partial
+  parse; the API selects the pages, so local pypdf auto-split is skipped and the
+  page markers count within the chosen range. Great for "just the intro + ch.1".
+- **`--lang ch|en`** → cloud `language` OCR hint. Default is the API's `"ch"`;
+  pass `en` for non-Chinese-only sources (the VLM still reads multilingual text).
+  For German academic books `en` usually beats `ch`; try both and spot-check.
+- **`--ocr`** → cloud `is_ocr`. Off by default; turn on for scanned/bitmap PDFs
+  that otherwise come back empty.
+- The result zip still delivers `full.md` + `content_list.json` + `images/` — the
+  inputs your printed-page markers, heading restoration, and page audit rely on.
+  The API's `extra_formats` (docx/html/latex) is left off on purpose.
+
+### NOT adopted (local-CLI-only in 4.0 — would break the cloud skill)
+- The `flash/basic/standard/advanced` **tier** flags: those are `--tier` on the
+  local `mineru`/`mineru-kit` CLI. The cloud API v4 still selects quality via
+  `model_version` (`vlm` = top quality ≈ the local `advanced/standard`;
+  `pipeline` = fast ≈ local `basic`). The cloud "flash" tier exists only via the
+  no-token Agent lightweight API (≤10 MB / ≤20 pages) — out of scope here.
+- The local **doc library** (`mineru server start`, `DoclibClient`,
+  `doc:{short_id}/tier:.../page:...` locators) and `mineru read` — the cloud
+  workflow has no persistent server to query.
+- Local parsing of **doc/docx/ppt/xls/images/epub/ofd/html** via the CLI: the
+  cloud API v4 accepts some of these, but your page-marker reconstruction reads
+  `page_number` blocks that only come from PDF/paged sources, so keep PDF as the
+  front door (use the separate python-docx path for `.docx`, as before).
+
+### Official 4.0 Python SDK (alternative, not required)
+MinerU 4.0 published `mineru-open-sdk` (`pip install mineru-open-sdk`, needs only
+`httpx`, Python ≥3.10) wrapping the same cloud API:
+`MinerU(token).extract(path, pages=..., ocr=..., language=..., model=...,
+extra_formats=[...])`. Handy for a quick one-off inside another script, but it
+does **not** do your printed-page markers, auto split/merge, decorative-image
+filtering, char-spacing cleanup, heading restoration, or batch manifest — so the
+bundled `mineru_convert.py` remains the recommended path for this skill's whole
+workflow.
 
 ## Critical gotchas (learned the hard way)
 

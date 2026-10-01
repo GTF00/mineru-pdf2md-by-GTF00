@@ -9,17 +9,28 @@ Modes (run `python3 mineru_convert.py <mode> ...`):
       "第 N 页" marker so merged chunks keep global page order.
 
   convert (input_pdf) (output_dir) [--model vlm] [--md-only|--full]
+          [--pages RANGES] [--lang ch|en] [--ocr] [--max-pages 180]
       Single-file pipeline: upload -> poll -> download -> reconstruct -> write.
       Files over --max-pages (default 180; MinerU hard limit 200) auto-split.
+      New in MinerU 4.0 (cloud OpenAPI v4):
+        --pages RANGES  Partial parse, e.g. "1-10" or "2,4-6". The API selects
+                        the pages and local auto-split is skipped; page markers
+                        count within the chosen range.
+        --lang ch|en    OCR/language hint (default: API default "ch"). Pass "en"
+                        for non-Chinese-only sources; the VLM stays multilingual.
+        --ocr           Enable OCR for scanned/bitmap PDFs (default off).
 
   split_convert (input_pdf) (output_dir) [--model vlm] [--max-pages 180] [--md-only|--full]
+          [--pages RANGES] [--lang ch|en] [--ocr]
       Alias of convert (auto-split is now built into convert). Kept for CLI compat.
 
   batch (input_dir) (output_dir) [--model vlm] [--md-only|--full]
-        [--workers 2] [--max-pages 180] [--force]
+        [--workers 2] [--max-pages 180] [--force] [--pages RANGES] [--lang ch|en] [--ocr]
       Walk input_dir for *.pdf, mirror the folder structure under output_dir,
-      convert each (auto-splitting >max-pages). Skips files whose .md already
-      exists unless --force. Writes _batch_manifest.jsonl (one JSON per file).
+      convert each (auto-splitting >max-pages unless --pages is given). Skips
+      files whose .md already exists unless --force. Writes _batch_manifest.jsonl
+      (one JSON per file). The 4.0 page/lang/ocr flags apply uniformly to the
+      whole batch.
 
   verify (output_dir) [--source (src_dir)] [--report (path)]
       Scan output_dir for MinerU-generated .md, verify page markers are present
@@ -132,12 +143,27 @@ def http_bytes(url, timeout=600, max_retries=5):
     raise RuntimeError(f"http_bytes retry exhausted: {url}")
 
 
-def upload_and_parse(local_pdf, model_version, token):
-    """Apply upload URL, PUT file bytes (NO Content-Type -> OSS presign match)."""
+def upload_and_parse(local_pdf, model_version, token, page_ranges=None, language=None, is_ocr=False):
+    """Apply upload URL, PUT file bytes (NO Content-Type -> OSS presign match).
+
+    MinerU 4.0 (cloud OpenAPI v4) extras — all opt-in so the default request body
+    is unchanged from before:
+      page_ranges : cloud 'page_ranges' (e.g. "1-10" or "2,4-6") — partial parse.
+                    Caller must skip local pypdf auto-split when this is set.
+      language    : "ch" (default) or "en"; for non-Chinese-only source pass "en"
+                    (the VLM still handles multilingual text). Omitted when None.
+      is_ocr      : enable OCR for scanned/bitmap PDFs (API default False).
+                    Omitted unless explicitly requested.
+    """
     name = os.path.basename(local_pdf)
-    body = json.dumps(
-        {"files": [{"name": name, "data_id": "wb"}], "model_version": model_version}
-    ).encode()
+    payload = {"files": [{"name": name, "data_id": "wb"}], "model_version": model_version}
+    if page_ranges:
+        payload["page_ranges"] = page_ranges
+    if language:
+        payload["language"] = language
+    if is_ocr:
+        payload["is_ocr"] = True
+    body = json.dumps(payload).encode()
     resp = json.loads(
         http("POST", f"{BASE}/file-urls/batch", token=token, data=body,
              headers={"Content-Type": "application/json"})
@@ -558,8 +584,13 @@ def _images_broken(out_md):
     return not (os.path.isdir(img_dir) and os.listdir(img_dir))
 
 
-def process_file(pdf, out_md, save_images, model, max_pages, token, force=False, drop_decorative=True):
-    """Convert one PDF to out_md. Returns a result dict for the manifest."""
+def process_file(pdf, out_md, save_images, model, max_pages, token, force=False, drop_decorative=True, pages=None, lang=None, ocr=False):
+    """Convert one PDF to out_md. Returns a result dict for the manifest.
+
+    pages/lang/ocr are the MinerU 4.0 cloud-API extras (see upload_and_parse).
+    When `pages` is set, local pypdf auto-split is skipped and the API selects
+    the requested page range.
+    """
     if os.path.exists(out_md) and not force:
         # 断点续跑：默认跳过已存在的 .md；但 full 模式下若 md 声明了图片而
         # _files 缺失/为空（被中断或旧 bug 产物），视为未完成、自动重做。
@@ -572,11 +603,12 @@ def process_file(pdf, out_md, save_images, model, max_pages, token, force=False,
         total = None
     stem = _safe_stem(pdf)
 
-    if total is None or total <= max_pages:
-        # ----- single (no split) -----
+    if pages or total is None or total <= max_pages:
+        # ----- single (no split) OR page-range partial parse (--pages) -----
         ext = None
         try:
-            bid = upload_and_parse(pdf, model, token)
+            bid = upload_and_parse(pdf, model, token, page_ranges=pages,
+                                   language=lang, is_ocr=ocr)
             zips = poll(bid, token)
             if not zips:
                 return {"status": "failed", "pages": total, "chunks": 1,
@@ -614,7 +646,7 @@ def process_file(pdf, out_md, save_images, model, max_pages, token, force=False,
         parts, ext_dirs = [], []
         ext_dirs_local = ext_dirs
         for (cpath, offset) in chunks:
-            bid = upload_and_parse(cpath, model, token)
+            bid = upload_and_parse(cpath, model, token, language=lang, is_ocr=ocr)
             zips = poll(bid, token)
             if not zips:
                 parts.append(f"<!-- 第 {offset + 1} 页起解析失败，跳过 -->")
@@ -643,22 +675,23 @@ def process_file(pdf, out_md, save_images, model, max_pages, token, force=False,
                 pass
 
 
-def convert(input_pdf, output_dir, model_version="vlm", save_images=True, max_pages=180, drop_decorative=True):
+def convert(input_pdf, output_dir, model_version="vlm", save_images=True, max_pages=180, drop_decorative=True, pages=None, lang=None, ocr=False):
     os.makedirs(output_dir, exist_ok=True)
     token = load_token()
     out_md = os.path.join(output_dir, _safe_stem(input_pdf) + ".md")
-    r = process_file(input_pdf, out_md, save_images, model_version, max_pages, token, force=False, drop_decorative=drop_decorative)
+    r = process_file(input_pdf, out_md, save_images, model_version, max_pages, token,
+                     force=False, drop_decorative=drop_decorative, pages=pages, lang=lang, ocr=ocr)
     print("WROTE:", out_md, "|", r["status"], r["error"])
     return r
 
 
-def split_convert(input_pdf, output_dir, model_version="vlm", max_pages=180, save_images=True, drop_decorative=True):
+def split_convert(input_pdf, output_dir, model_version="vlm", max_pages=180, save_images=True, drop_decorative=True, pages=None, lang=None, ocr=False):
     # auto-split is now inside convert/process_file; this is a thin alias
-    return convert(input_pdf, output_dir, model_version, save_images, max_pages, drop_decorative)
+    return convert(input_pdf, output_dir, model_version, save_images, max_pages, drop_decorative, pages, lang, ocr)
 
 
 def batch(in_dir, out_dir, model="vlm", save_images=True, max_pages=180,
-          workers=2, force=False, drop_decorative=True):
+          workers=2, force=False, drop_decorative=True, pages=None, lang=None, ocr=False):
     os.makedirs(out_dir, exist_ok=True)
     token = load_token()
     jobs = []
@@ -673,7 +706,8 @@ def batch(in_dir, out_dir, model="vlm", save_images=True, max_pages=180,
 
     def work(j):
         pdf, out_md = j
-        return process_file(pdf, out_md, save_images, model, max_pages, token, force, drop_decorative)
+        return process_file(pdf, out_md, save_images, model, max_pages, token,
+                             force, drop_decorative, pages, lang, ocr)
 
     if workers <= 1:
         for pdf, out_md in jobs:
@@ -814,6 +848,9 @@ if __name__ == "__main__":
     p_c.add_argument("input_pdf"); p_c.add_argument("output_dir")
     p_c.add_argument("--model", default="vlm")
     p_c.add_argument("--max-pages", type=int, default=180)
+    p_c.add_argument("--pages", default=None, help='page range, e.g. "1-10" or "2,4-6" (MinerU 4.0)')
+    p_c.add_argument("--lang", default=None, choices=["ch", "en"], help='OCR/language hint (API default "ch")')
+    p_c.add_argument("--ocr", action="store_true", help="enable OCR for scanned/bitmap PDFs")
     p_c.add_argument("--md-only", dest="save", action="store_false", default=None)
     p_c.add_argument("--full", dest="save", action="store_true")
 
@@ -821,6 +858,9 @@ if __name__ == "__main__":
     p_s.add_argument("input_pdf"); p_s.add_argument("output_dir")
     p_s.add_argument("--model", default="vlm")
     p_s.add_argument("--max-pages", type=int, default=180)
+    p_s.add_argument("--pages", default=None, help='page range, e.g. "1-10" or "2,4-6" (MinerU 4.0)')
+    p_s.add_argument("--lang", default=None, choices=["ch", "en"], help='OCR/language hint (API default "ch")')
+    p_s.add_argument("--ocr", action="store_true", help="enable OCR for scanned/bitmap PDFs")
     p_s.add_argument("--md-only", dest="save", action="store_false", default=None)
     p_s.add_argument("--full", dest="save", action="store_true")
 
@@ -830,6 +870,9 @@ if __name__ == "__main__":
     p_b.add_argument("--workers", type=int, default=2)
     p_b.add_argument("--max-pages", type=int, default=180)
     p_b.add_argument("--force", action="store_true")
+    p_b.add_argument("--pages", default=None, help='page range for the whole batch, e.g. "1-10" (MinerU 4.0)')
+    p_b.add_argument("--lang", default=None, choices=["ch", "en"], help='OCR/language hint (API default "ch")')
+    p_b.add_argument("--ocr", action="store_true", help="enable OCR for scanned/bitmap PDFs")
     p_b.add_argument("--md-only", dest="save", action="store_false", default=None)
     p_b.add_argument("--full", dest="save", action="store_true")
 
@@ -851,12 +894,15 @@ if __name__ == "__main__":
         open(args.out_md, "w", encoding="utf-8").write(out)
         print("WROTE", args.out_md)
     elif args.mode == "convert":
-        convert(args.input_pdf, args.output_dir, args.model, save, args.max_pages)
+        convert(args.input_pdf, args.output_dir, args.model, save, args.max_pages,
+                pages=args.pages, lang=args.lang, ocr=args.ocr)
     elif args.mode == "split_convert":
-        split_convert(args.input_pdf, args.output_dir, args.model, args.max_pages, save)
+        split_convert(args.input_pdf, args.output_dir, args.model, args.max_pages, save,
+                      pages=args.pages, lang=args.lang, ocr=args.ocr)
     elif args.mode == "batch":
         batch(args.input_dir, args.output_dir, args.model, save,
-              args.max_pages, args.workers, args.force)
+              args.max_pages, args.workers, args.force,
+              pages=args.pages, lang=args.lang, ocr=args.ocr)
     elif args.mode == "verify":
         verify(args.output_dir, args.source, args.report)
     elif args.mode == "inventory":

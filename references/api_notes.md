@@ -10,6 +10,29 @@ Auth: `Authorization: Bearer <token>` on every request.
 | Poll status | `GET /extract-results/batch/{batch_id}` | `data.extract_result[].state` -> `done` / `failed`; `data.extract_result[].full_zip_url` when done |
 | (URL source) | `POST /extract/task/batch` | For already-hosted PDFs: `{"files":[{"url":...,"data_id":...}],"model_version":"vlm"}` |
 
+### MinerU 4.0 — request-body fields (all optional, opt-in)
+
+These were added on the cloud OpenAPI v4 and are now exposed by `mineru_convert.py`
+via `--pages` / `--lang` / `--ocr`. They are omitted from the JSON body unless the
+user asks, so the default request is unchanged from before.
+
+| Field | CLI flag | Example | Effect |
+|-------|----------|---------|--------|
+| `page_ranges` | `--pages` | `"1-10"`, `"2,4-6"` | Partial parse; API selects the pages. When set, the script skips local pypdf auto-split. Page markers count within the chosen range. |
+| `language` | `--lang` | `"ch"` (default) / `"en"` | OCR/language hint. Pass `en` for non-Chinese-only sources; the VLM stays multilingual. |
+| `is_ocr` | `--ocr` | `true` | Enable OCR for scanned/bitmap PDFs (API default `false`). |
+| `enable_formula` | (default on) | `true` | Formula recognition; left at API default `true`. |
+| `enable_table` | (default on) | `true` | Table recognition; left at API default `true`. |
+| `extra_formats` | — | `["docx","html","latex"]` | Extra export formats. Left off: this skill consumes the Markdown + `content_list.json` + `images/` from the zip. |
+
+Notes:
+- Model quality on the cloud API is still chosen by `model_version` (`vlm` =
+  top quality; `pipeline` = fast). The 4.0 `flash/basic/standard/advanced` *tiers*
+  are a **local-CLI** concept (`--tier` on `mineru`/`mineru-kit`) and do NOT apply
+  to this cloud skill.
+- The cloud API also exposes a no-token Agent lightweight API (`/api/v1/agent/...`,
+  ≤10 MB / ≤20 pages, `flash` model only) — out of scope for batch/page-marker work.
+
 Downloaded zip (`full_zip_url`) contains:
 - `(id)_content_list.json` — list of blocks; each has `page_idx` (0-based) and
   `type`. `type=="page_number"` blocks carry the **real printed page number** in

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.md.orig
+*.md.failed
+
+# OS
+.DS_Store
+
+# Local secrets / token files (never commit)
+secrets/
+*.token
+mineru_api_token
